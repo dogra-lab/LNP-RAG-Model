@@ -1,0 +1,10 @@
+anthropic>=1.15
+pymupdf
+sentence-transformers
+rank-bm25
+numpy
+tqdm
+openai
+python-dotenv
+fastapi
+uvicorn

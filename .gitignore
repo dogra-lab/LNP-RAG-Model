@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+index/
+results/
+papers/
+.env
+node_modules/
+frontend/dist/
+included_papers/
+paper used/
