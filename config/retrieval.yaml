@@ -1,0 +1,41 @@
+# Retrieval tuning. Every key is optional; defaults live in lnp_rag/config.py
+# (RetrievalConfig). Re-run scripts/evaluate.py after changing anything here.
+
+# Candidate generation (per query variant)
+dense_top_k: 120
+bm25_top_k: 120
+
+# Reciprocal Rank Fusion
+rrf_k: 60
+original_query_weight: 1.0
+expanded_query_weight: 0.6
+dense_weight: 1.0
+bm25_weight: 0.8
+
+# Cross-encoder reranking: number of fused chunks scored (latency scales linearly)
+rerank_candidates: 120
+min_chunk_relevance: 0.05
+
+# Paper-level aggregation
+max_evidence_per_paper: 5
+paper_aggregation_decay: 0.5
+paper_aggregation_top_n: 4
+evidence_type_coverage_bonus: 0.05
+
+# Claude synthesis
+synthesis_top_papers: 10
+synthesis_score_weight: 0.25
+
+boosts:
+  figure_caption: 0.15
+  table_caption: 0.12
+  results_section: 0.10
+  methods_section: 0.04
+  abstract: 0.02
+  quantitative: 0.06
+  in_vitro_or_vivo_label: 0.03
+  intent_quantitative: 0.10
+  intent_multi_timepoint: 0.15
+  intent_dose: 0.08
+  intent_figure: 0.08
+  review_paper_multiplier: 0.80

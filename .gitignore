@@ -1,10 +1,13 @@
 .venv/
 __pycache__/
-index/
-results/
-papers/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# secrets
 .env
-node_modules/
-frontend/dist/
-included_papers/
-paper used/
+
+# local data: PDFs, index, caches, generated reports
+papers/
+data/
+reports/

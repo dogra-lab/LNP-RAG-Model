@@ -1,75 +1,547 @@
-# LNP-RAG-Model
+# LNP Paper Search: hybrid RAG over a local PDF library
 
-Retrieves the top 100 papers from the local PDF library (`papers/`) for a query about a step of the
-LNP delivery journey, then screens each candidate with an LLM (OpenAI or Claude) using the LNP screening prompt
-(`lnp_rag/screen.py::_system_prompt`).
+Index a folder of scientific PDFs, then ask natural-language questions such as
 
-## Pipeline
+> *Find research papers containing quantitative cellular uptake data for lipid nanoparticles (LNPs),
+> especially histograms or curves showing uptake over time. Prioritize studies with multiple time
+> points and clear experimental conditions.*
 
-1. **Ingest** (`ingest.py`, run once): every PDF is parsed with PyMuPDF into title, abstract,
-   figure/table captions, Results section and full-text chunks. Identical files in several folders
-   are deduplicated. Review articles are flagged heuristically. Chunks are embedded with
-   `BAAI/bge-base-en-v1.5` and indexed with BM25.
-2. **Retrieve** (`search.py`): hybrid search (dense + BM25, reciprocal-rank fusion at paper level)
-   picks the top `--candidates` papers (default 200).
-3. **Screen**: each candidate goes to the LLM (`gpt-5-mini` by default with `OPENAI_API_KEY`,
-   or `claude-opus-5-5` with `--provider anthropic`) with the system prompt built from
-   the step, and a user message with the title, abstract, captions and the Results excerpts most
-   relevant to the query. Review articles are marked `REVIEW ARTICLE`. The model returns
-   `score / verdict / study_type / rationale` as schema-validated JSON.
-4. **Rank**: include > borderline > exclude, then by score. The top `--top` (default 100) are
-   printed and saved to `results/<timestamp>_<query>.csv` and `.json`.
+and get back a **ranked list of papers** (not just text chunks). Each result has its supporting
+excerpts, figure/table captions, page numbers, an in vitro / in vivo label, and an explanation that cites
+only text retrieved from the PDF. A link opens the original PDF at the relevant page.
 
-## Validated papers (`paper used/`)
+Everything except the optional LLM explanation step (OpenAI or Claude) runs locally.
 
-`paper used/` holds the curated in-vitro papers. Supplements (`P007B.pdf`, `P06B.pdf`, ...) are
-merged into their main paper. Every search returns all of them in a "validated" section, ordered
-by relevance to the query and not re-screened. The additional results come from the library with
-copies of validated papers removed (same title, or title+abstract similarity >= 0.94). Library
-papers are also ranked by how similar they are to the validated set, to surface papers you may be
-missing (turn off with `--no-validated-similarity` or the checkbox in the UI). Re-index after
-changing the folder: `.venv/bin/python ingest.py --only-validated` (about a minute).
+---
 
-## Setup
+## 1. Architecture
 
-```bash
-uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.txt
-export OPENAI_API_KEY=sk-...        # or ANTHROPIC_API_KEY with --provider anthropic
-.venv/bin/python ingest.py            # builds ./index (re-run when papers change)
+```
+                          INGESTION (scripts/index_papers.py or POST /index)
+ papers/**/*.pdf ──► scan + SHA-256 ──► diff vs catalog ──► parse (PyMuPDF, OCR fallback)
+                     (new / modified /                       │  reading order, headers/footers removed,
+                      deleted / moved)                       │  headings, sections, captions
+                                                             ▼
+                                         metadata (title, authors, DOI, year[, Crossref])
+                                                             ▼
+                                         structure-aware chunks + evidence features
+                                         (time points, units, dose, in vitro/in vivo, review?)
+                                                             ▼
+                        ┌──────────── embeddings (BGE / MedCPT / OpenAI, cached) ────────────┐
+                        ▼                                    ▼                               ▼
+               ChromaDB (vectors)                 SQLite catalog (source of truth)     bm25s (keywords)
+
+                          SEARCH (scripts/search.py, POST /search, Streamlit UI)
+ query ──► query expansion (synonyms / optional LLM paraphrases; original kept, weighted highest)
+       ──► dense top-120 per variant  +  BM25 top-120 (original, and with expansion terms)
+       ──► Reciprocal Rank Fusion ──► top-120 chunks ──► cross-encoder rerank (bge-reranker-base)
+       ──► evidence boosts (captions, results/methods, numbers, ≥2 time points, dose; intent-gated)
+       ──► paper-level aggregation (decayed sum of best chunks, evidence-type diversity, review penalty)
+       ──► LLM synthesis on the top 10: grounded explanations citing excerpt IDs; citations verified
+       ──► ranked papers with excerpts, captions, pages, sections, study type, PDF links
 ```
 
-## Usage
+| Layer | Choice | Why |
+|---|---|---|
+| PDF parsing | **PyMuPDF** | Fast (≈0.1 s per paper), exposes font size and weight per span, which the heading/caption detection needs, and renders pages for OCR and the review tool. |
+| OCR | **Tesseract** via pytesseract | Runs locally and is good enough for scanned journal pages. It only runs on pages with almost no extractable text, and is skipped with a warning if the binary is not installed. |
+| Chunking | Custom, structure-aware | Chunks never cross a section boundary, captions are standalone chunks, references and back matter are dropped, and windows split at sentence boundaries with overlap. |
+| Embeddings | **BAAI/bge-base-en-v1.5** (default) | See [§2](#2-embedding-model-comparison). Configurable. |
+| Vector DB | **ChromaDB** (embedded, persistent) | No server for local use, and the same API works against a Chroma server for deployment. Cosine HNSW with metadata filters. |
+| Keyword search | **bm25s** + scientific tokenizer | Sparse-matrix BM25, milliseconds over ~100k chunks, persisted to disk. The tokenizer keeps `DLin-MC3-DMA` / `SM-102` whole and also splits them into parts. |
+| Fusion | **Reciprocal Rank Fusion** | Works on ranks only, so cosine and BM25 scores never need calibrating against each other. |
+| Reranking | **BAAI/bge-reranker-base** cross-encoder | Local, and much more accurate than embedding similarity. It only sees the fused top-N. |
+| Synthesis | **OpenAI** (`gpt-5.4-mini`) or **Claude** (`claude-opus-5-5`) | One strict structured-output call per search. The model only sees retrieved excerpts tagged with IDs, and code removes any citation to an ID it was not given. `LLM_PROVIDER=auto` uses whichever key is set (Claude if both). |
+| Catalog | **SQLite** | Single source of truth for papers, chunks and file hashes. Vectors and BM25 can always be rebuilt from it. |
+| API / UI | **FastAPI** + **Streamlit** | Async API with background indexing and a simple UI. The UI only talks HTTP, so either side can be replaced or deployed separately. |
+
+### Design assumptions (sensible defaults, all configurable)
+
+* **Paper identity = file content hash.** Renaming or moving a PDF, or copying it into a second folder, never
+  re-embeds it. Duplicates collapse into one paper that remembers all of its paths and folders. Your library
+  had 1,789 files and 1,779 unique papers.
+* **Folders are labels.** Sub-folder names (`Cellular_Uptake_Papers`, `In vitro`, …) are stored as
+  `folder_labels`. They can be used as a search filter and as weak labels for evaluation.
+* **Evidence comes from the paper's own text.** Introduction and discussion sentences often describe *other*
+  studies, so the in vitro / in vivo label is derived only from abstract, methods, results and caption text.
+* **Review articles are demoted, not removed** (score × 0.8). They rarely contain primary data, but the
+  user may still want them. A filter excludes them completely.
+* **Figures are understood through their captions.** The system reads caption text; it does not interpret
+  plot images. A histogram whose caption never mentions time points cannot be matched on time points.
+* **Explanations never invent facts.** Without an LLM key, or if the call fails, each result gets an
+  extractive summary built from detected signals, clearly marked "automatic". Results whose evidence is
+  weak are labeled `insufficient`.
+
+---
+
+## 2. Embedding model comparison
+
+| Model | Type | Dim | Max tokens | Runs | Cost | Notes |
+|---|---|---|---|---|---|---|
+| **BAAI/bge-base-en-v1.5** (default) | General-purpose retrieval | 768 | 512 | Local (MPS/CUDA/CPU) | Free | Strong general retrieval model; measured ≈20–30 chunks/s on an Apple M4 GPU. Handles full-text paragraphs and captions well; the cross-encoder corrects most domain misses. |
+| ncbi/MedCPT (query + article encoders) | Biomedical, asymmetric | 768 | 512 article / 64 query | Local | Free | Trained on PubMed search logs, so it understands biomedical vocabulary best. Trained on title+abstract pairs, so full-text paragraphs are slightly out of domain; two encoders means about twice the memory. |
+| BAAI/bge-small-en-v1.5 | General-purpose | 384 | 512 | Local | Free | About 3× faster for very large libraries or CPU-only machines; lower quality. |
+| OpenAI text-embedding-3-large | General-purpose API | 3072 | 8191 | Remote | Paid per token (≈35M tokens for this library, one-time) | No local GPU needed and very long context. Sends your PDF text to OpenAI. |
+
+**Recommendation:** keep **bge-base** as the default. It is local, free, already a strong retriever, and
+here it is followed by a cross-encoder reranker, which matters more for final quality than the choice of
+embedding model. **MedCPT** is the best alternative to try for biomedical-specific queries. Switch, rebuild
+and compare with the evaluation script ([§9](#9-evaluation-and-manual-validation)):
 
 ```bash
-# Preset step (see lnp_rag/steps.py), kinetic data required
-.venv/bin/python search.py "LNP internalization kinetics" --step cellular_uptake --strict-kinetic
-
-# Custom step
-.venv/bin/python search.py "ApoE adsorption on ionizable LNPs" \
-    --step-name "Protein corona" --step-description "plasma protein adsorption onto LNPs" \
-    --guidance "Count ApoE/albumin binding measured over time as kinetic evidence."
-
-# Retrieval only (no API calls, free)
-.venv/bin/python search.py "endosomal escape efficiency" --no-llm
+EMBEDDING_PROVIDER=medcpt DATA_DIR=./data-medcpt python scripts/index_papers.py
+EMBEDDING_PROVIDER=medcpt DATA_DIR=./data-medcpt python scripts/evaluate.py eval/labeled_queries.jsonl
+python scripts/evaluate.py eval/labeled_queries.jsonl          # default model, for comparison
 ```
 
-Useful flags: `--only-relevant` (drop `exclude`), `--candidates N`, `--top N`, `--provider`, `--model`,
-`--effort low|medium|high`, `--workers N`.
+Using a separate `DATA_DIR` keeps both indexes side by side. The index records which model built it and
+refuses to mix models.
 
-Screening verdicts are cached in `index/screen_cache.jsonl`, so repeating a query with the same
-step settings costs nothing. With the defaults, a fresh query screens 200 papers at roughly
-4-5k input tokens each.
+---
 
-## Web app (React)
+## 3. Folder structure
+
+```
+LNP-RAG-Model/
+├── lnp_rag/
+│   ├── config.py              # Settings (env/.env) + RetrievalConfig (config/retrieval.yaml)
+│   ├── models.py              # Pydantic models: chunks, papers, API request/response
+│   ├── logging_setup.py       # JSON or console structured logging
+│   ├── embeddings.py          # SentenceTransformers / MedCPT / OpenAI providers + disk cache
+│   ├── services.py            # Lazily-built shared components
+│   ├── evaluation.py          # Metrics + labeled dataset loader
+│   ├── ingest/
+│   │   ├── pdf_parser.py      # layout-aware parsing, headings, captions, sections
+│   │   ├── ocr.py             # Tesseract fallback
+│   │   ├── cleaning.py        # unicode/ligature/hyphenation normalisation
+│   │   ├── metadata.py        # title, authors, DOI, year, Crossref client
+│   │   ├── features.py        # time points, quantities, dose, in vitro/in vivo, review detection
+│   │   ├── chunker.py         # structure-aware chunking
+│   │   └── pipeline.py        # incremental indexer (scan → parse → embed → store)
+│   ├── store/
+│   │   ├── catalog.py         # SQLite catalog
+│   │   ├── vector_store.py    # ChromaDB
+│   │   └── bm25_index.py      # bm25s + scientific tokenizer
+│   ├── retrieval/
+│   │   ├── query_expansion.py # synonym rules / LLM paraphrases
+│   │   ├── fusion.py          # Reciprocal Rank Fusion
+│   │   ├── reranker.py        # cross-encoder
+│   │   ├── scoring.py         # evidence boosts + paper aggregation
+│   │   └── searcher.py        # orchestration
+│   ├── synthesis/
+│   │   ├── prompts.py         # shared prompts, JSON schemas, provider interface
+│   │   ├── openai_llm.py      # OpenAI client (strict JSON schema, retries)
+│   │   ├── claude.py          # Claude client (structured output, retries, fallbacks)
+│   │   └── grounding.py       # citation verification + extractive fallback
+│   └── api/main.py            # FastAPI app
+├── ui/streamlit_app.py        # Streamlit front end
+├── scripts/
+│   ├── index_papers.py        # index / re-index / rebuild / stats
+│   ├── search.py              # CLI search
+│   ├── evaluate.py            # retrieval metrics on a labeled set
+│   └── review_results.py      # manual validation pack + label conversion
+├── config/
+│   ├── retrieval.yaml         # fusion weights, boosts, candidate sizes
+│   └── synonyms.yaml          # domain synonyms for query expansion
+├── eval/labeled_queries.jsonl # starter evaluation set
+├── tests/                     # pytest suite (synthetic PDFs, no network/models needed)
+├── papers/                    # your PDFs (git-ignored)
+├── data/                      # index + caches (git-ignored, safe to delete)
+├── requirements.txt  pyproject.toml  .env.example
+└── Dockerfile  docker-compose.yml
+```
+
+---
+
+## 4. Installation
+
+Requires Python 3.11+ (tested with 3.12) and about 3 GB of disk for models and the index.
 
 ```bash
-cd frontend && npm install && npm run build && cd ..   # build the React UI once (re-run after UI changes)
-.venv/bin/uvicorn app:app --port 8000                   # then open http://localhost:8000
+cd LNP-RAG-Model
+uv venv --python 3.12 .venv          # or: python3.12 -m venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt   # or: pip install -r requirements.txt
+
+# Optional, only for scanned PDFs (OCR fallback):
+brew install tesseract               # macOS
+# sudo apt-get install tesseract-ocr # Debian/Ubuntu
 ```
 
-The page shows the top papers with verdict, LLM score, study type, review flag and rationale.
-You can filter by verdict, study type or review status, filter by text, re-sort, download a CSV,
-and click a title to open the PDF. Each search is also saved to `results/`.
+The embedding and reranker models (≈1.5 GB) download from Hugging Face on first use and are cached in
+`~/.cache/huggingface`. After that, everything works offline (`HF_HUB_OFFLINE=1`).
 
-For UI development with hot reload, run `npm run dev` in `frontend/` (port 5173, proxies `/api` to
-port 8000) alongside uvicorn.
+Run the tests (about 6 s, no models or network needed):
+
+```bash
+python -m pytest
+```
+
+## 5. Where to put the PDFs
+
+Put PDFs anywhere under `papers/` (or point `PAPERS_DIR` / the UI's folder box somewhere else). Sub-folders
+are scanned recursively and their names become filterable labels:
+
+```
+papers/
+├── Cellular_Uptake_Papers/*.pdf
+├── In vitro/*.pdf
+├── In vitro + in vivo/*.pdf
+├── Unclassified/*.pdf
+└── uploads/*.pdf          # files uploaded through the UI/API land here
+```
+
+## 6. API keys and configuration
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`:
+
+* `OPENAI_API_KEY=...` turns on grounded explanations with `OPENAI_MODEL` (default `gpt-5.4-mini`; use
+  `gpt-5.5` for higher quality). Each search makes one call over the top 10 papers' excerpts.
+* `ANTHROPIC_API_KEY=...` is the alternative (Claude). With both keys set, `LLM_PROVIDER=auto` picks Claude;
+  set `LLM_PROVIDER=openai` to force OpenAI.
+* `QUERY_EXPANSION_MODE=llm` also asks the LLM for intent-preserving query paraphrases (one extra call).
+* Without any key, everything still works, with extractive explanations.
+* Embeddings stay local regardless of the LLM key; `EMBEDDING_PROVIDER=openai` is a separate choice that
+  needs a full rebuild.
+* `CROSSREF_ENABLED=true` is recommended. It fills in accurate title, authors and year from each paper's DOI
+  (cached; sends only DOIs to api.crossref.org). Without it, these come from PDF metadata and page-1
+  heuristics.
+
+Keys are read only from the environment or `.env` and are never logged. Retrieval tuning lives in
+`config/retrieval.yaml`, and domain synonyms in `config/synonyms.yaml`.
+
+## 7. Index the papers
+
+```bash
+python scripts/index_papers.py                        # first run: everything; later runs: only changes
+python scripts/index_papers.py --papers-dir ~/pdfs    # a different folder
+python scripts/index_papers.py --rebuild              # wipe and re-process every PDF
+python scripts/index_papers.py --stats                # paper / chunk counts, study types, folders
+```
+
+On an Apple M4, the first full run over the 1,779-paper library (109,337 chunks) took about 1.5 hours,
+almost all of it embedding (the second half of the run did 963 papers in 51 minutes). Embedding is the
+bottleneck, and parsing all PDFs takes only a few minutes. Re-runs only touch new, modified or deleted
+files, and an interrupted run resumes where it stopped. The UI's **Index Papers** button does the same in
+the background, with a progress bar.
+
+## 8. Run the application
+
+Two terminals:
+
+```bash
+uvicorn lnp_rag.api.main:app --host 127.0.0.1 --port 8000     # API  → http://localhost:8000/docs
+streamlit run ui/streamlit_app.py                             # UI   → http://localhost:8501
+```
+
+If port 8000 is already taken by another app, use another port and tell both sides about it:
+
+```bash
+API_PUBLIC_URL=http://localhost:8001 uvicorn lnp_rag.api.main:app --port 8001
+API_URL=http://localhost:8001 streamlit run ui/streamlit_app.py
+```
+
+The UI has a folder box, Index Papers, Rebuild / Clear, PDF upload, the search box, a result count,
+filters (in vitro, in vivo, year range, title, has figures/tables, has quantitative data, exclude reviews,
+folder) and result cards. Each card has expandable supporting excerpts, captions, and **Open PDF at page N**
+buttons; the browser's PDF viewer jumps to that page.
+
+Or from the command line, without the server:
+
+```bash
+python scripts/search.py "quantitative LNP uptake over time" -k 5
+python scripts/search.py "LNP biodistribution in mice" --in-vivo --exclude-reviews --no-synthesis
+```
+
+### Docker
+
+```bash
+cp .env.example .env    # add keys
+docker compose up --build
+# UI http://localhost:8501, API http://localhost:8000
+docker compose exec api python scripts/index_papers.py   # or use the UI button
+```
+
+`./papers` is mounted into the container. The Docker index lives in `./data/docker`, separate from a local
+run's `./data`, because the stored paths differ. The image uses CPU-only PyTorch, so indexing is slower
+than on a local Apple-Silicon or CUDA GPU.
+
+---
+
+## 9. Test query and example output
+
+With the full library indexed (1,779 papers, 109,337 chunks), the spec's test query:
+
+```bash
+python scripts/search.py "Find research papers containing quantitative cellular uptake data for lipid \
+nanoparticles (LNPs), especially histograms or curves showing uptake over time. Prioritize studies with \
+multiple time points and clear experimental conditions." -k 5 --no-synthesis
+```
+
+Actual output (top 3 of 5, excerpts shortened):
+
+```
+Query variants: ['...lipid nanoparticle (LNPs)...', '...cell uptake data...', '...time-dependent uptake...', 'BM25 +79 terms']
+Timings (ms): {'expansion': 13.7, 'retrieval': 527.1, 'rerank': 4457.2, 'total': 4998.7}
+
+#1  [1.112] Lipid Nanoparticles Deliver the Therapeutic VEGFA mRNA In Vitro and In Vivo and Transform
+            Extracellular Vesicles for Their Functional Extensions
+     2023 | DOI: 10.1002/advs.202206187 | pages [3, 4] | both | evidence: strong
+       [P1-E1] p.4 Figure 1 (figure_caption): Figure 1. Kinetics of cellular uptake of lipid nanoparticles
+               (LNPs) and LNP-mRNA. A) Schematic representation of LNP-mRNA delivery, cellular uptake ...
+       [P1-E2] p.3 2.1. Kinetics of Cellular Uptake of Lipid Nanoparticles and Their mRNA (paragraph): The
+               results show that cellular uptake of LNPs occurred quickly. Within 5 h, approximately 80% of
+               14C-labeled LNPs had disappeared from the cell culture supernatants ... (Figure 1B). Between
+               24 and 96 h ...
+     Open: http://localhost:8000/papers/b7f7537b094a1019/pdf#page=3
+
+#2  [0.862] Design of lipid nanoparticle (LNP) containing genetic material CRISPR/Cas9 for familial
+            hypercholesterolemia
+     Neng F. Kurniati, Catur Riani, Diky Mudhakir | 2025 | pages [4, 9] | in vitro | evidence: partial
+     Missing: a matching figure/table caption
+       [P2-E1] p.4 Cellular uptake efficiency assay (paragraph): ... LNP was modified with DiD ...
+
+#3  [0.812] Lipid nanoparticles and PEG: The timeframe of immune checkpoint blockade can be controlled by
+            adjusting the rate of cellular uptake of nanoparticles
+     Andrew S Choi, Taylor J Moon, Anubhuti Bhalotia et al. | 2025 | pages [9] | both | evidence: partial
+       [P3-E1] p.9 The distribution of LNPs in tumor, blood and lymph node over time (paragraph): ...
+               the uptake of LNPs by immune cells is 3-fold higher ...
+```
+
+Ranks 4–5 were *Tunable Lipid Coatings Enable Cytoplasmic siRNA Delivery by DNA Origami* (Figure 3: uptake in
+BV2 cells after 1, 6 and 12 h) and *Exploring the Challenges of Lipid Nanoparticle Development: The In
+Vitro-In Vivo Correlation Gap* (Figure 2: SM-102 LNP uptake in three cell lines at 24 and 48 h).
+
+That run used `--no-synthesis`, so explanations are the automatic kind. With `OPENAI_API_KEY` set
+(`gpt-5.4-mini`; the LLM call adds about 10 s), the same query gave these explanations (actual output):
+
+> **#1 VEGFA mRNA LNPs** (strong): The excerpts directly report quantitative cellular uptake kinetics for LNPs
+> in HTB-177 cells using 14C-radiolabeled LNPs measured at different time points, with n = 3 [P1-E1]. They also
+> show flow cytometry quantification of Cy5-labeled mRNA-containing LNP uptake at different time points and
+> state that after 2 h, most cells (>90%) were positive [P1-E1][P1-E2].
+>
+> **CRISPR/Cas9 LNP for familial hypercholesterolemia** (partial): The excerpts show quantitative cellular
+> uptake measurements for DiD-labeled LNPs and comparisons between 4°C and 37°C … However, they do not show
+> uptake over multiple time points or a kinetic curve/histogram over time, so the time-course element of the
+> query is not clearly supported. *Missing: multiple time points / uptake over time curves or histograms.*
+
+Citation IDs the model was not given are stripped, and an explanation with no valid citation is downgraded to
+`insufficient`.
+
+**Known limitation:** time-point detection is a regex. It also counts incidental durations, such as "centrifuged for
+2 min", so treat `n_timepoints` as a ranking signal and confirm on the page (see §10).
+
+### Sample API requests and responses
+
+Interactive docs: `http://localhost:8000/docs`.
+
+```bash
+curl -s localhost:8000/health
+```
+```json
+{"status":"ok","version":"1.0.0","indexed_papers":1779,"indexing":false,"llm_enabled":true,
+ "llm_provider":"openai","llm_model":"gpt-5.4-mini","embedding_model":"BAAI/bge-base-en-v1.5",
+ "reranker":"BAAI/bge-reranker-base"}
+```
+
+```bash
+# start incremental indexing in the background (rebuild: true to wipe first)
+curl -s -X POST localhost:8000/index -H 'content-type: application/json' \
+     -d '{"papers_dir": "/path/to/papers", "rebuild": false}'
+curl -s localhost:8000/index/status
+```
+```json
+{"state":"idle","message":"","total_files":0,"processed_files":0,"new":0,"modified":0,"deleted":0,"unchanged":0,"failed":[],"chunks_indexed":0,"started_at":null,"finished_at":null}
+```
+
+That is the idle state. While a run is in progress, `state` moves through scanning → parsing/embedding → indexing →
+done, and `processed_files / total_files` gives the progress.
+
+```bash
+curl -s -X POST localhost:8000/search -H 'content-type: application/json' -d '{
+  "query": "time-dependent cellular uptake of LNPs measured by flow cytometry",
+  "top_k": 2,
+  "synthesize": true,
+  "filters": {"exclude_reviews": true, "in_vitro": null, "year_min": null, "has_quantitative": null}
+}'
+```
+
+Actual response, captured before an LLM key was configured (one result shown, excerpt text shortened). With a
+key, `explanation_source` is `"openai"` and the model writes the explanation, as shown above:
+
+```json
+{
+  "query": "time-dependent cellular uptake of LNPs measured by flow cytometry",
+  "expanded_queries": [
+    "time-dependent cellular uptake of lipid nanoparticle measured by flow cytometry",
+    "time-dependent cell uptake of LNPs measured by flow cytometry",
+    "multiple time points cellular uptake of LNPs measured by flow cytometry",
+    "BM25 +53 terms"
+  ],
+  "total_candidates": 63,
+  "results": [
+    {
+      "rank": 1,
+      "paper_id": "14c01836de90ae4b",
+      "title": "Cell-intrinsic mechanisms underlying species differences in lipid nanoparticle-mRNA delivery",
+      "authors": [],
+      "filename": "Cell-intrinsic mechanisms underlying species differences in lipid nanoparticle-mRNA delivery.pdf",
+      "doi": "10.21203/rs.3.rs-9180848/v1",
+      "year": null,
+      "relevance_score": 1.464,
+      "pages": [4, 5, 12, 13],
+      "sections": ["Species differences in LNP association with cell membrane in hepatocytes",
+                   "Flow cytometry and imaging flow cytometry analysis of LNP cell association and uptake",
+                   "Differential efficiency of LNP intracellular uptake in species hepatocytes"],
+      "study_type": "both",
+      "study_type_basis": "detected from methods/results/caption text",
+      "is_review": false,
+      "explanation": "Matched by keyword/semantic retrieval (automatic summary, not an LLM judgement): Species differences in LNP association with cell membrane in hepatocytes (p. 5) contains uptake measurement terms, 3 time points (5 min, 20 min, 180 min), numeric values, dose/concentration [P1-E1]; ...",
+      "explanation_source": "extractive",
+      "evidence_strength": "strong",
+      "missing_evidence": "",
+      "cited_evidence_ids": ["P1-E1", "P1-E2", "P1-E3"],
+      "evidence": [
+        {
+          "evidence_id": "P1-E1",
+          "text": "To examine potential differences in kinetics and dose-dependency of LNP cell membrane association, MC3fLuc-Rhod LNP were incubated with species hepatocytes ... analyzed by flow cytometry ... cells were treated with a single dose (2 pg/cell) of LNP for up to 180 min ... At the initial time points of 5 and 20 mins, a similar median intensity of LNP signal was measured across all three species (Fig. 4b).",
+          "chunk_type": "paragraph",
+          "section": "Species differences in LNP association with cell membrane in hepatocytes",
+          "page": 5,
+          "score": 1.4127,
+          "rerank_score": 0.9811,
+          "features": {"has_quantitative": true, "n_timepoints": 3, "timepoints": ["5 min", "20 min", "180 min"],
+                       "has_dose": true, "has_uptake_terms": true, "mentions_in_vitro": true, "mentions_in_vivo": true},
+          "pdf_url": "http://localhost:8000/papers/14c01836de90ae4b/pdf#page=5"
+        }
+      ],
+      "captions": [],
+      "pdf_url": "http://localhost:8000/papers/14c01836de90ae4b/pdf#page=4"
+    }
+  ],
+  "timings_ms": {"expansion": 25.4, "retrieval": 2216.6, "rerank": 4401.8, "total": 6645.1},
+  "warnings": ["LLM synthesis disabled (no OPENAI_API_KEY or ANTHROPIC_API_KEY); showing extractive explanations."]
+}
+```
+
+Other endpoints: `GET /stats`, `GET /papers/{paper_id}`, `GET /papers/{paper_id}/pdf` (served inline, so
+`#page=N` works), `POST /upload` (multipart `files`, PDFs only), `DELETE /index`.
+
+---
+
+## 10. Evaluation and manual validation
+
+### Metrics
+
+```bash
+python scripts/evaluate.py eval/labeled_queries.jsonl                 # retrieval only (free, deterministic)
+python scripts/evaluate.py eval/labeled_queries.jsonl --out reports/eval.json
+python scripts/evaluate.py eval/labeled_queries.jsonl --no-rerank     # ablation: no cross-encoder
+python scripts/evaluate.py eval/labeled_queries.jsonl --expansion none
+python scripts/evaluate.py eval/labeled_queries.jsonl --synthesis     # includes LLM re-scoring (API cost)
+```
+
+Reported per query and on average: **Precision@K, Recall@K, MRR, NDCG@K, Hit@K** at the paper level, plus a
+**page hit rate** (the fraction of labeled evidence pages the returned evidence points to) when labels
+include pages.
+
+Dataset format (`eval/labeled_queries.jsonl`, one JSON object per line):
+
+```json
+{"query_id": "uptake-kinetics",
+ "query": "quantitative cellular uptake of LNPs at multiple time points",
+ "relevant": [{"paper": "CU_005_Flash_nanoprecipitation_....pdf", "grade": 2, "pages": [5, 12],
+               "evidence": "Fig. 2: uptake after 2, 6 and 24 h in RAW 264.7 cells"}],
+ "relevant_folder": "Cellular_Uptake_Papers",
+ "filters": {"exclude_reviews": true}}
+```
+
+`paper` can be a filename, relative path, DOI or paper ID. `grade` 2 means exactly what the query asks for
+and 1 means partially relevant. `relevant_folder` treats every paper in a folder as relevant. That is cheap
+but noisy: recall@10 is necessarily tiny when a folder holds 242 papers, so read precision@K and NDCG for
+those queries. The starter file has four queries. Hand-labeled queries (below) are what make the numbers
+trustworthy.
+
+### Baseline on the starter set (full library, no LLM)
+
+| query | n relevant (folder) | MRR | P@5 | NDCG@10 | Hit@5 |
+|---|---|---|---|---|---|
+| uptake-kinetics | 242 | 0.33 | 0.20 | 0.13 | 1.0 |
+| uptake-flow-cytometry | 242 | 0.13 | 0.00 | 0.07 | 0.0 |
+| internalization-synonym | 242 | 0.07 | 0.00 | 0.00 | 0.0 |
+| in-vivo-biodistribution | 849 | 1.00 | 0.80 | 0.86 | 1.0 |
+
+The low uptake numbers are mostly a **labeling artifact, not missed papers**. Many of the top results are clear
+uptake studies filed under `In vitro` or `In vitro + in vivo`, for example *"Solid Lipid Nanoparticles Surface
+Modification Modulates Cell Internalization…"*, *"Effect of Nanoparticle Weight on the Cellular Uptake…"* and
+*"The Internal Nanostructure of Lipid Nanoparticles Influences Their Diverse Cellular…"*, so the folder labels
+count them as wrong. Hand-label these queries with the review tool below to get trustworthy numbers.
+
+### Manually validating that results really contain quantitative evidence
+
+```bash
+python scripts/review_results.py review "quantitative LNP uptake over time" -k 15 --out reports/review_uptake
+open reports/review_uptake/review.html
+```
+
+For every result, `review.html` shows the explanation, the excerpts, and a **rendering of the PDF page with
+the excerpt highlighted**. You can check the actual figure or table in seconds instead of opening each PDF.
+For each paper, check:
+
+1. **Is the measurement uptake?** Fluorescence intensity / MFI, % positive cells, or an amount per cell,
+   not transfection or protein expression unless that is what you want.
+2. **Is it quantitative?** A plotted or tabulated value with units or error bars, not just representative
+   images.
+3. **Are there ≥2 time points** in the same experiment? Check the figure axis or legend, not just the methods
+   text.
+4. **Are the conditions stated?** Cell type, dose/concentration, formulation, temperature.
+5. **Is it the paper's own data?** A review citing someone else's figure does not count.
+
+Fill in `review.csv` (`relevant` 0/1/2, `has_quantitative_uptake`, `multiple_timepoints`, `evidence_pages`,
+`notes`), then convert it into an evaluation entry:
+
+```bash
+python scripts/review_results.py labels reports/review_uptake/review.csv \
+    --append eval/labeled_queries.jsonl --query-id uptake-kinetics-manual
+```
+
+Note that a manual review only grades papers the system returned. To estimate recall, also add relevant
+papers you know of that it missed. Folder labels help here.
+
+## 11. Improving retrieval quality
+
+Change one thing at a time and re-run `scripts/evaluate.py` after each change.
+
+1. **Label 10–20 real queries** with the review tool. This matters more than any parameter.
+2. **Enable Crossref** (`CROSSREF_ENABLED=true`, then rebuild) for correct titles, authors and years, which
+   makes year filters reliable.
+3. **Synonyms.** Add your lab's vocabulary to `config/synonyms.yaml`: lipid names, cell lines, assay names.
+   Put true synonyms under `equivalent` and evidence words under `related`.
+4. **Boosts.** If captions or methods are over- or under-ranked, adjust `boosts` in `config/retrieval.yaml`.
+   The intent-gated boosts only fire when the query asks for that kind of evidence.
+5. **Bigger reranker.** `RERANKER_MODEL=BAAI/bge-reranker-v2-m3` is more accurate and about 3× slower.
+   `rerank_candidates` trades latency for recall.
+6. **Embedding model.** Compare MedCPT as in §2.
+7. **LLM.** `QUERY_EXPANSION_MODE=llm` adds paraphrases that keep the original intent,
+   `synthesis_score_weight` sets how much the LLM's assessment re-orders the top 10, and a stronger
+   `OPENAI_MODEL` (e.g. `gpt-5.5`) gives better judgements at higher cost.
+8. **Chunking.** `CHUNK_TARGET_WORDS` 150–300, then rebuild. Smaller chunks give more precise evidence;
+   larger ones give more context per chunk.
+9. **Inspect failures.** For a missed paper, run `scripts/search.py --json` and check whether it was absent
+   from the candidates (a recall problem: synonyms, BM25, embeddings) or present but ranked low (a ranking
+   problem: reranker, boosts, aggregation).
+
+## 12. Troubleshooting
+
+* **"Index was built with embedding model X"**: you changed `EMBEDDING_MODEL`. Rebuild, or use a different
+  `DATA_DIR`.
+* **Scanned PDFs return no text**: install Tesseract. The indexer reports `image-only page and OCR
+  unavailable` in its warnings.
+* **LLM explanations missing**: check `GET /health` (`llm_enabled`, `llm_provider`) and the warnings shown above the
+  results. Rate limits and outages fall back to extractive explanations automatically.
+* **Slow first search**: models load on API start-up (a warm-up runs in the background). Later searches take
+  a few seconds, mostly cross-encoder reranking.

@@ -1,0 +1,49 @@
+# Domain synonym groups for query expansion.
+#
+# equivalent: terms that mean the same thing in this corpus. A query mentioning
+#             one of them generates paraphrased variants for dense retrieval and
+#             adds the others as BM25 keywords.
+# related:    terms that are *evidence of* the concept but not synonyms. They are
+#             only added as low-weight BM25 keywords, never used to rewrite the
+#             query, so the search intent cannot drift.
+#
+# Matching is case-insensitive on word boundaries. Keep groups narrow: e.g.
+# "liposome" is deliberately NOT listed as an LNP synonym.
+
+equivalent:
+  - [lipid nanoparticle, lipid nanoparticles, LNP, LNPs, lipid-based nanocarrier, lipid-based nanocarriers,
+     lipid nanocarrier, lipid nanocarriers, ionizable lipid nanoparticle, ionizable lipid nanoparticles,
+     lipid-based nanoparticle, lipid-based nanoparticles]
+  - [cellular uptake, cell uptake, cellular internalization, cellular internalisation, internalization,
+     internalisation, cellular entry, cell association, cell-associated, nanoparticle uptake]
+  - [uptake over time, time-dependent uptake, uptake kinetics, kinetic uptake profile, time course of uptake,
+     uptake at multiple time points, time-course uptake]
+  - [multiple time points, different time points, several time points, time course, time-course, kinetics,
+     over time, time-dependent]
+  - [fluorescence intensity, mean fluorescence intensity, MFI, median fluorescence intensity]
+  - [flow cytometry, FACS, fluorescence-activated cell sorting, cytometric analysis]
+  - [confocal microscopy, confocal imaging, CLSM, confocal laser scanning microscopy]
+  - [in vitro, cultured cells, cell culture, cell lines]
+  - [in vivo, animal model, mice, mouse model, murine model]
+  - [biodistribution, tissue distribution, organ distribution]
+  - [transfection efficiency, transfection, gene expression, protein expression]
+  - [endosomal escape, endosomal release, endosome escape]
+  - [siRNA, small interfering RNA]
+  - [mRNA, messenger RNA]
+  - [solid lipid nanoparticle, solid lipid nanoparticles, SLN, SLNs]
+  - [nanostructured lipid carrier, nanostructured lipid carriers, NLC, NLCs]
+  - [dose-dependent, dose dependent, concentration-dependent, dose-response, dose response]
+  - [histogram, histograms, flow cytometry histogram]
+  - [quantitative, quantified, quantification, quantitative analysis]
+  - [blood-brain barrier, BBB]
+  - [PEG-lipid, PEGylated lipid, PEG lipid, PEG]
+  - [ionizable lipid, ionizable lipids, ionizable cationic lipid, ionisable lipid]
+
+related:
+  cellular uptake: [endocytosis, flow cytometry, confocal, fluorescence intensity, MFI, DiD, DiI, Cy5, rhodamine,
+                    FITC, labeled, labelled, percentage of positive cells, positive cells]
+  uptake over time: [0.5 h, 1 h, 2 h, 4 h, 6 h, 8 h, 12 h, 24 h, 48 h, time points, incubation time]
+  quantitative: [mean ± SD, mean ± SEM, fold, percentage, "%", statistically significant, p <]
+  dose-dependent: [mg/kg, μg/mL, nM, concentration, dose]
+  histogram: [flow cytometry, distribution, gating]
+  lipid nanoparticle: [DLin-MC3-DMA, MC3, SM-102, ALC-0315, C12-200, DOTAP, DSPC, cholesterol, DMG-PEG]

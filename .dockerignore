@@ -1,0 +1,9 @@
+.venv
+.git
+.env
+papers
+data
+reports
+**/__pycache__
+.pytest_cache
+.DS_Store

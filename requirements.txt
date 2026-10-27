@@ -1,10 +1,31 @@
-anthropic>=1.15
-pymupdf
-sentence-transformers
-rank-bm25
-numpy
-tqdm
-openai
-python-dotenv
-fastapi
-uvicorn
+# Tested with Python 3.12 on macOS (Apple Silicon) and in the python:3.12-slim Docker image.
+# PDF parsing + OCR
+pymupdf==2.0
+pytesseract==0.3.13
+pillow==13.0.0
+# Embeddings + reranking (local models)
+torch==2.14.1
+transformers==5.20.2
+sentence-transformers==6.2.0
+# Retrieval stores
+chromadb==1.5.9
+bm25s==0.3.15
+PyStemmer==3.1.0
+numpy==2.5.4
+# LLM synthesis (either provider)
+openai==3.39.0
+anthropic==2.3.0
+# API + UI
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+streamlit==1.66.1
+httpx==0.28.1
+# Config / utilities
+pydantic==2.14.1
+pydantic-settings==2.16.1
+python-dotenv==1.2.4
+pyyaml==6.0.3
+tenacity==9.2.1
+# Tests
+pytest==9.1.1

@@ -1,0 +1,18 @@
+[project]
+name = "lnp-rag"
+version = "1.0.0"
+description = "Hybrid RAG search over a local library of scientific PDFs, with grounded Claude explanations"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.setuptools]
+packages = ["lnp_rag", "lnp_rag.ingest", "lnp_rag.store", "lnp_rag.retrieval", "lnp_rag.synthesis", "lnp_rag.api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
