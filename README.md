@@ -250,6 +250,25 @@ filters (in vitro, in vivo, year range, title, has figures/tables, has quantitat
 folder) and result cards. Each card has expandable supporting excerpts, captions, and **Open PDF at page N**
 buttons; the browser's PDF viewer jumps to that page.
 
+### React UI for the multi-agent search
+
+[frontend/](frontend/) is a React app (Vite + TypeScript) for `POST /agents/search`. You type a query and
+pick folders. It then shows each folder's funnel (papers → sent to critic → accepted), plus Accepted and
+Rejected tabs. Each paper card shows the critic's reason, clickable evidence citations, verified quotes,
+the excerpts the critic saw, and **open at page** PDF links. Results can be exported as CSV or JSON.
+Requires Node 18+.
+
+```bash
+cd frontend
+npm install                     # first time only
+npm run dev                     # → http://localhost:5173 (expects the API on port 8000)
+API_URL=http://127.0.0.1:8001 npm run dev    # if the API runs on another port
+```
+
+The dev server proxies `/api/*` to the API, so no CORS setup is needed. Keep `API_PUBLIC_URL` on the API
+side pointing at the API's real port, because the PDF links use it. `npm run build && npm run preview`
+serves the production build on port 4173 with the same proxy.
+
 Or from the command line, without the server:
 
 ```bash
@@ -430,6 +449,46 @@ key, `explanation_source` is `"openai"` and the model writes the explanation, as
 
 Other endpoints: `GET /stats`, `GET /papers/{paper_id}`, `GET /papers/{paper_id}/pdf` (served inline, so
 `#page=N` works), `POST /upload` (multipart `files`, PDFs only), `DELETE /index`.
+
+### Multi-agent search: every relevant paper, checked by a critic
+
+`/search` returns a ranked top-k. Use `/agents/search` when you need **all** the relevant
+papers instead. It runs one retriever agent and one critic agent per folder (`In vitro`,
+`In vitro + in vivo`, `Unclassified`, `Cellular_Uptake_Papers`), and the four folder pairs run
+in parallel ([lnp_rag/agents/](lnp_rag/agents/)).
+
+1. **Retriever** ([retriever_agent.py](lnp_rag/agents/retriever_agent.py)) scores *every*
+   chunk in its folder: dense cosine against all stored chunk vectors, plus BM25 against all
+   chunk texts. Chunks include paragraphs, figure captions and table captions. A paper is a
+   candidate if any chunk clears an absolute bar, so a paper that matches only in a figure
+   caption still counts. The cross-encoder rescores each candidate's best chunks. Papers just
+   under the threshold go to the critic as **near-misses** to be re-checked. Weaker matches
+   are dropped, but the folder report counts them.
+2. **Critic** ([critic_agent.py](lnp_rag/agents/critic_agent.py)) receives the candidates and
+   near-misses in batches. For each paper it returns ACCEPT/REJECT. For an ACCEPT, the reason
+   explains why the paper is a correct answer, with excerpt citations and verbatim quotes.
+   Quotes that do not appear in the cited excerpt are discarded. An ACCEPT that is left with
+   no real evidence is turned into a REJECT.
+3. **Orchestrator** ([orchestrator.py](lnp_rag/agents/orchestrator.py)) merges the accepted
+   papers and removes duplicates, so a PDF stored in two folders appears once, with both
+   folder labels and `found_by`. It also returns each folder's rejected papers with the
+   critic's reasons.
+
+There is no top-k anywhere in this path. The settings under `agents:` in
+[config/retrieval.yaml](config/retrieval.yaml) are score thresholds or per-paper cost caps.
+
+```bash
+python scripts/search.py "quantitative cellular uptake of LNPs over time" --agents
+python scripts/search.py "..." --agents --folder "In vitro" --show-rejected
+python scripts/search.py "..." --agents --no-critic          # no LLM calls (heuristic verdicts)
+curl -s localhost:8000/agents/search -H 'content-type: application/json' \
+     -d '{"query": "uptake of LNPs measured by flow cytometry at several time points"}'
+python scripts/evaluate.py eval/labeled_queries.jsonl --agents [--critic]   # recall per folder
+```
+
+Cost: the critic makes one LLM call per `critic_batch_size` candidate papers. A broad query
+can produce a few hundred candidates. If that is too slow or expensive, raise
+`candidate_min_score`; do not add a top-k back.
 
 ---
 

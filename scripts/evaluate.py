@@ -5,9 +5,15 @@
     python scripts/evaluate.py eval/labeled_queries.jsonl -k 1 5 10 20 --out reports/eval.json
     python scripts/evaluate.py eval/labeled_queries.jsonl --synthesis    # include LLM re-scoring
     python scripts/evaluate.py eval/labeled_queries.jsonl --no-rerank    # ablation: fusion only
+    python scripts/evaluate.py eval/labeled_queries.jsonl --agents       # multi-agent recall per folder
+    python scripts/evaluate.py eval/labeled_queries.jsonl --agents --critic   # ...with LLM critics
 
 Metrics are computed at the paper level (Precision@K, Recall@K, MRR, NDCG@K,
 Hit@K) plus a page-level evidence hit rate when labels include pages.
+
+``--agents`` evaluates the multi-agent folder search instead. It returns an
+unranked set, so it reports set recall and precision overall and per folder
+(recall in folder F = relevant papers in F accepted / relevant papers in F).
 """
 from __future__ import annotations
 
@@ -21,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lnp_rag.config import get_settings  # noqa: E402
 from lnp_rag.evaluation import evaluate_ranking, load_dataset, mean_metrics  # noqa: E402
 from lnp_rag.logging_setup import setup_logging  # noqa: E402
-from lnp_rag.models import SearchFilters, SearchRequest  # noqa: E402
+from lnp_rag.models import AgentSearchRequest, SearchFilters, SearchRequest  # noqa: E402
 from lnp_rag.services import Services  # noqa: E402
 
 
@@ -33,6 +39,8 @@ def main() -> int:
     ap.add_argument("--no-rerank", action="store_true", help="disable the cross-encoder (ablation)")
     ap.add_argument("--expansion", choices=["none", "rules", "llm"], help="override QUERY_EXPANSION_MODE")
     ap.add_argument("--out", type=Path, help="write per-query and mean metrics as JSON")
+    ap.add_argument("--agents", action="store_true", help="evaluate the multi-agent folder search")
+    ap.add_argument("--critic", action="store_true", help="--agents: use the LLM critics (costs API calls)")
     args = ap.parse_args()
 
     settings = get_settings()
@@ -47,6 +55,8 @@ def main() -> int:
         print("Index is empty - run scripts/index_papers.py first.", file=sys.stderr)
         return 1
     dataset = load_dataset(args.dataset, papers)
+    if args.agents:
+        return evaluate_agents(services, dataset, papers, args)
     depth = max(args.ks)
 
     rows, per_query = [], []
@@ -79,6 +89,53 @@ def main() -> int:
         return 1
     mean = mean_metrics(rows)
     print("\nMean over", len(rows), "queries")
+    width = max(len(k) for k in mean)
+    for k, v in mean.items():
+        print(f"  {k:<{width}}  {v:.4f}")
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps({"mean": mean, "queries": per_query}, indent=2))
+        print(f"\nWrote {args.out}")
+    return 0
+
+
+def evaluate_agents(services, dataset, papers, args) -> int:
+    folders = services.cfg.agents.folders
+    per_query, sums = [], {}
+    for lq in dataset:
+        relevant = {p for p, g in lq.grades.items() if g >= 1}
+        if not relevant:
+            print(f"[{lq.query_id}] skipped: no resolvable relevant papers", file=sys.stderr)
+            continue
+        resp = services.agents.search(AgentSearchRequest(query=lq.query, filters=SearchFilters(**lq.filters),
+                                                         use_critic=args.critic))
+        accepted = {p.paper_id for p in resp.accepted}
+        row = {"recall": len(accepted & relevant) / len(relevant),
+               "precision": len(accepted & relevant) / len(accepted) if accepted else 0.0,
+               "accepted": len(accepted), "relevant": len(relevant)}
+        for f in folders:
+            rel_f = {p for p in relevant if f in papers[p].folder_labels}
+            if rel_f:
+                row[f"recall[{f}]"] = len(accepted & rel_f) / len(rel_f)
+        hand = {p for p, g in lq.grades.items() if g >= 2}
+        if hand:
+            row["recall[grade 2]"] = len(accepted & hand) / len(hand)
+        missed = sorted(papers[p].filename for p in hand - accepted)
+        per_query.append({"query_id": lq.query_id, "metrics": row, "missed_grade2": missed,
+                          "folders": [{"folder": r.folder, "candidates": r.candidates, "near_misses": r.near_misses,
+                                       "accepted": len(r.accepted), "rejected": len(r.rejected)}
+                                      for r in resp.folders]})
+        for k, v in row.items():
+            sums.setdefault(k, []).append(v)
+        print(f"[{lq.query_id}] " + " ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
+                                              for k, v in row.items()))
+        if missed:
+            print(f"    missed hand-labelled papers: {missed}")
+    if not per_query:
+        print("No evaluable queries.", file=sys.stderr)
+        return 1
+    mean = {k: sum(v) / len(v) for k, v in sums.items()}
+    print(f"\nMean over {len(per_query)} queries ({'LLM' if args.critic else 'heuristic'} critics)")
     width = max(len(k) for k in mean)
     for k, v in mean.items():
         print(f"  {k:<{width}}  {v:.4f}")

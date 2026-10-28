@@ -39,3 +39,20 @@ boosts:
   intent_dose: 0.08
   intent_figure: 0.08
   review_paper_multiplier: 0.80
+
+# Multi-agent folder search (scripts/search.py --agents, POST /agents/search).
+# One retriever + one critic agent per folder. No top-k anywhere: every value
+# below is an absolute score bar or a per-paper cost cap, never a cap on how
+# many papers are returned. Check recall with: scripts/evaluate.py --agents
+agents:
+  folders: ["In vitro", "In vitro + in vivo", "Unclassified", "Cellular_Uptake_Papers"]
+  # A paper is a candidate if ANY chunk (paragraph, figure or table caption) clears either bar.
+  dense_min_similarity: 0.70   # cosine; bge-base scores ~0.65 for unrelated in-domain text
+  bm25_min_ratio: 0.50         # chunk BM25 / best BM25 in the folder
+  rerank_chunks_per_paper: 3   # best chunks per candidate paper sent to the cross-encoder (~27 chunks/s on an M4)
+  caption_chunks_per_paper: 1  # plus the best matching caption if not already among them
+  candidate_min_score: 0.10    # paper score -> sent to the critic
+  near_miss_min_score: 0.03    # -> critic re-check; below = dropped (reported as a count)
+  evidence_per_paper: 6        # excerpts shown to the critic (all reranked captions are added)
+  critic_batch_size: 6         # papers per LLM call
+  critic_concurrency: 6        # parallel LLM calls across all folders

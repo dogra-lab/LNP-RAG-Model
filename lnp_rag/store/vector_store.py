@@ -68,6 +68,19 @@ class VectorStore:
         )
         return [(cid, 1.0 - dist) for cid, dist in zip(res["ids"][0], res["distances"][0])]
 
+    def get_vectors(self, chunk_ids: list[str], batch: int = 5000) -> np.ndarray:
+        """Stored embeddings for ``chunk_ids`` in the same order (zeros if missing)."""
+        out: np.ndarray | None = None
+        for i in range(0, len(chunk_ids), batch):
+            ids = chunk_ids[i : i + batch]
+            res = self._col.get(ids=ids, include=["embeddings"])
+            pos = {cid: j for j, cid in enumerate(ids)}
+            for cid, emb in zip(res["ids"], res["embeddings"]):
+                if out is None:
+                    out = np.zeros((len(chunk_ids), len(emb)), dtype=np.float32)
+                out[i + pos[cid]] = emb
+        return out if out is not None else np.zeros((len(chunk_ids), 0), dtype=np.float32)
+
     def _open(self):
         return self._client.get_or_create_collection(
             COLLECTION,

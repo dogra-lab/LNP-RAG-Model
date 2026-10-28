@@ -44,10 +44,16 @@ class Catalog:
         self._conn.executescript(_SCHEMA)
         self._lock = threading.RLock()
 
+    def _fetch(self, sql: str, params: Iterable = ()) -> list[tuple]:
+        # One connection is shared by threads (API workers, parallel folder agents):
+        # reads take the lock too, so cursors never interleave.
+        with self._lock:
+            return self._conn.execute(sql, tuple(params)).fetchall()
+
     # --- key/value -------------------------------------------------------------
     def get_kv(self, key: str) -> str | None:
-        row = self._conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else None
+        rows = self._fetch("SELECT value FROM kv WHERE key = ?", (key,))
+        return rows[0][0] if rows else None
 
     def set_kv(self, key: str, value: str) -> None:
         with self._lock, self._conn:
@@ -55,7 +61,7 @@ class Catalog:
 
     # --- files -----------------------------------------------------------------
     def files(self) -> dict[str, tuple[int, float, str]]:
-        rows = self._conn.execute("SELECT path, size, mtime, sha256 FROM files").fetchall()
+        rows = self._fetch("SELECT path, size, mtime, sha256 FROM files")
         return {p: (s, m, h) for p, s, m, h in rows}
 
     def upsert_file(self, path: str, size: int, mtime: float, sha256: str) -> None:
@@ -96,14 +102,14 @@ class Catalog:
             self._conn.execute("DELETE FROM papers WHERE paper_id = ?", (paper_id,))
 
     def paper_ids(self) -> set[str]:
-        return {r[0] for r in self._conn.execute("SELECT paper_id FROM papers")}
+        return {r[0] for r in self._fetch("SELECT paper_id FROM papers")}
 
     def get_paper(self, paper_id: str) -> PaperMeta | None:
-        row = self._conn.execute("SELECT meta FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
-        return PaperMeta.model_validate_json(row[0]) if row else None
+        rows = self._fetch("SELECT meta FROM papers WHERE paper_id = ?", (paper_id,))
+        return PaperMeta.model_validate_json(rows[0][0]) if rows else None
 
     def all_papers(self) -> dict[str, PaperMeta]:
-        rows = self._conn.execute("SELECT paper_id, meta FROM papers").fetchall()
+        rows = self._fetch("SELECT paper_id, meta FROM papers")
         return {pid: PaperMeta.model_validate_json(m) for pid, m in rows}
 
     # --- chunks ----------------------------------------------------------------
@@ -112,24 +118,27 @@ class Catalog:
         for i in range(0, len(chunk_ids), 500):
             batch = chunk_ids[i : i + 500]
             q = f"SELECT chunk_id, data FROM chunks WHERE chunk_id IN ({','.join('?' * len(batch))})"
-            for cid, data in self._conn.execute(q, batch):
+            for cid, data in self._fetch(q, batch):
                 out[cid] = Chunk.model_validate_json(data)
         return out
 
     def chunks_for_paper(self, paper_id: str) -> list[Chunk]:
-        rows = self._conn.execute(
-            "SELECT data FROM chunks WHERE paper_id = ? ORDER BY ordinal", (paper_id,)
-        ).fetchall()
+        rows = self._fetch("SELECT data FROM chunks WHERE paper_id = ? ORDER BY ordinal", (paper_id,))
         return [Chunk.model_validate_json(r[0]) for r in rows]
+
+    def caption_chunk_ids(self) -> set[str]:
+        """Ids of every figure/table caption chunk."""
+        return {r[0] for r in self._fetch(
+            "SELECT chunk_id FROM chunks WHERE json_extract(data, '$.chunk_type') "
+            "IN ('figure_caption', 'table_caption')"
+        )}
 
     def iter_embed_texts(self) -> Iterator[tuple[str, str, str]]:
         """(chunk_id, paper_id, embed_text) in a stable order."""
-        yield from self._conn.execute(
-            "SELECT chunk_id, paper_id, embed_text FROM chunks ORDER BY paper_id, ordinal"
-        )
+        yield from self._fetch("SELECT chunk_id, paper_id, embed_text FROM chunks ORDER BY paper_id, ordinal")
 
     def count_chunks(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        return self._fetch("SELECT COUNT(*) FROM chunks")[0][0]
 
     def clear(self) -> None:
         with self._lock, self._conn:

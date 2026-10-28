@@ -6,6 +6,7 @@ import os
 import threading
 from functools import cached_property
 
+from lnp_rag.agents.orchestrator import AgentOrchestrator
 from lnp_rag.config import RetrievalConfig, Settings, get_retrieval_config, get_settings
 from lnp_rag.embeddings import Embedder, build_embedder
 from lnp_rag.ingest.pipeline import Indexer
@@ -74,6 +75,15 @@ class Services:
         s = self.settings
         if not s.synthesis_enabled and s.query_expansion_mode not in ("llm", "claude"):
             return None
+        return self._build_llm()
+
+    @cached_property
+    def critic_llm(self) -> LLMClient | None:
+        """LLM for the folder critic agents (used even when synthesis is disabled)."""
+        return self.__dict__.get("llm") or self._build_llm()
+
+    def _build_llm(self) -> LLMClient | None:
+        s = self.settings
         provider = self.llm_provider
         if provider == "openai":
             from lnp_rag.synthesis.openai_llm import OpenAIClient
@@ -94,6 +104,10 @@ class Services:
         return QueryExpander(self.settings.query_expansion_mode, self.settings.synonyms_path, self.llm)
 
     @cached_property
+    def agents(self) -> AgentOrchestrator:
+        return AgentOrchestrator(self.searcher, self.critic_llm)
+
+    @cached_property
     def searcher(self) -> Searcher:
         return Searcher(
             self.settings,
@@ -110,7 +124,7 @@ class Services:
     def prepare_rebuild(self) -> None:
         """Drop the vector collection (even if built with another embedding model) and
         forget components that hold a reference to it."""
-        for name in ("vectors", "searcher", "indexer"):
+        for name in ("vectors", "searcher", "agents", "indexer"):
             self.__dict__.pop(name, None)
         self.__dict__["vectors"] = VectorStore(self.settings.chroma_dir, self.embedding_model_id, reset=True)
         self.catalog.clear()

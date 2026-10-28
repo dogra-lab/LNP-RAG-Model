@@ -20,7 +20,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from lnp_rag import __version__
 from lnp_rag.config import get_settings
 from lnp_rag.logging_setup import setup_logging
-from lnp_rag.models import IndexRequest, IndexStatus, PaperMeta, SearchRequest, SearchResponse
+from lnp_rag.models import (
+    AgentSearchRequest,
+    AgentSearchResponse,
+    IndexRequest,
+    IndexStatus,
+    PaperMeta,
+    SearchRequest,
+    SearchResponse,
+)
 from lnp_rag.services import Services
 
 log = logging.getLogger("lnp_rag.api")
@@ -161,6 +169,14 @@ def create_app(services: Services | None = None, warmup: bool = True) -> FastAPI
         try:
             return await run_in_threadpool(state.services.searcher.search, req)
         except RuntimeError as exc:  # e.g. embedding-model mismatch
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/agents/search", response_model=AgentSearchResponse)
+    async def agent_search(req: AgentSearchRequest) -> AgentSearchResponse:
+        """Multi-agent folder search: every relevant paper, each with a critic verdict."""
+        try:
+            return await run_in_threadpool(state.services.agents.search, req)
+        except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
 
     # --- papers -----------------------------------------------------------------

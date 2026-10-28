@@ -82,6 +82,95 @@ PARAPHRASE_SCHEMA = {
     "additionalProperties": False,
 }
 
+CRITIC_SYSTEM = """\
+You are the critic agent for one folder of a scientific paper collection. A retriever agent \
+searched that folder and proposed candidate papers for a researcher's query. Your job is to \
+check each candidate and decide whether it really answers the query.
+
+For each paper you receive numbered excerpts retrieved from its PDF: paragraphs, figure \
+captions and table captions. These excerpts are the only information you have about the paper. \
+Figure and table captions are full evidence: a paper whose matching data is described only in \
+a caption (e.g. "Figure 3. Uptake of DiD-LNPs at 1, 4 and 24 h") answers the query.
+
+For every paper:
+- verdict: "ACCEPT" if the excerpts show the paper contains what the query asks for, i.e. \
+its core request (the measurement, material and system asked about). Anything introduced by \
+"especially", "prioritize", "preferably", "ideally" or "such as" is a preference, not a \
+requirement: a paper that meets the core request but lacks a preferred element (e.g. it \
+has uptake data at a single time point when several are preferred) is still ACCEPT, and \
+the reason says which preferred element is missing. "REJECT" if the excerpts do not show the core request, or only mention it in passing \
+(e.g. the introduction citing other work, or a review summarising other studies).
+- reason: for ACCEPT, 1-3 sentences explaining WHY the paper is a correct answer: which \
+requested element each excerpt shows, citing excerpt IDs in brackets, e.g. [P2-E1]. For \
+REJECT, one sentence on what is missing. Quote numbers and time points exactly as written. \
+Do not use outside knowledge about the paper.
+- cited_evidence_ids: the excerpt IDs the verdict relies on.
+- quotes: for ACCEPT, 1-3 short verbatim quotes (copied exactly, character for character) from \
+the cited excerpts that prove the match, each with its excerpt ID. Empty for REJECT.
+
+Before judging any paper, fill in core_request (the elements a paper MUST show to answer \
+the query) and preferences (elements that only make a paper a better match). Then judge \
+every paper against core_request alone.
+
+Papers marked as near-miss scored just under the retriever's threshold; judge them by the \
+same standard, since the retriever may have under-scored them.\
+"""
+
+CRITIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "core_request": {"type": "string"},
+        "preferences": {"type": "string"},
+        "papers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "paper_key": {"type": "string"},
+                    "verdict": {"type": "string", "enum": ["ACCEPT", "REJECT"]},
+                    "reason": {"type": "string"},
+                    "cited_evidence_ids": {"type": "array", "items": {"type": "string"}},
+                    "quotes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "evidence_id": {"type": "string"},
+                                "quote": {"type": "string"},
+                            },
+                            "required": ["evidence_id", "quote"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["paper_key", "verdict", "reason", "cited_evidence_ids", "quotes"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["core_request", "preferences", "papers"],
+    "additionalProperties": False,
+}
+
+
+def critic_user_message(query: str, folder: str, papers: list[dict]) -> str:
+    """``papers``: [{key, title, is_review, near_miss, evidence: [{id, type, section, page, text}]}]."""
+    parts = [f"<query>{escape(query)}</query>", f"<folder>{escape(folder)}</folder>", "<papers>"]
+    for p in papers:
+        parts.append(f"<paper key={quoteattr(p['key'])}>")
+        parts.append(f"<title>{escape(p['title'])}</title>")
+        if p.get("is_review"):
+            parts.append("<note>Detected as a review article.</note>")
+        if p.get("near_miss"):
+            parts.append("<note>Near-miss: scored just under the retriever threshold.</note>")
+        for e in p["evidence"]:
+            parts.append(
+                f"<excerpt id={quoteattr(e['id'])} type={quoteattr(e['type'])} "
+                f"section={quoteattr(e['section'])} page=\"{e['page']}\">{escape(e['text'])}</excerpt>"
+            )
+        parts.append("</paper>")
+    parts.append("</papers>")
+    return "\n".join(parts)
 
 
 def synthesis_user_message(query: str, papers: list[dict]) -> str:
@@ -115,3 +204,5 @@ class LLMClient(Protocol):
     def synthesize(self, query: str, papers: list[dict]) -> dict[str, dict]: ...
 
     def paraphrase_query(self, query: str, n: int = 3) -> list[str]: ...
+
+    def review(self, query: str, folder: str, papers: list[dict]) -> dict[str, dict]: ...

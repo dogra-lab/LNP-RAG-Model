@@ -138,6 +138,29 @@ class EvidenceBoosts(BaseModel):
     review_paper_multiplier: float = 0.80
 
 
+class AgentConfig(BaseModel):
+    """Multi-agent folder search (``lnp_rag.agents``). No rank cutoffs: every
+    threshold here is an absolute score, so the number of returned papers is
+    whatever clears it."""
+
+    folders: list[str] = Field(default_factory=lambda: [
+        "In vitro", "In vitro + in vivo", "Unclassified", "Cellular_Uptake_Papers",
+    ])
+    # Candidate generation: a paper is a candidate if ANY of its chunks clears either bar.
+    dense_min_similarity: float = 0.70  # cosine(query, chunk); bge-base median is ~0.65 for in-domain text
+    bm25_min_ratio: float = 0.50  # BM25 score / best BM25 score in the folder
+    # Cost control per candidate paper (never limits how many papers are considered).
+    rerank_chunks_per_paper: int = 3
+    caption_chunks_per_paper: int = 1  # matching captions reranked in addition
+    # Routing on the paper score after reranking.
+    candidate_min_score: float = 0.10  # -> critic
+    near_miss_min_score: float = 0.03  # -> critic re-check; below this the paper is dropped (counted)
+    # Critic
+    evidence_per_paper: int = 6
+    critic_batch_size: int = 6  # papers per LLM call
+    critic_concurrency: int = 6  # parallel LLM calls across all folders
+
+
 class RetrievalConfig(BaseModel):
     dense_top_k: int = 120  # per query variant
     bm25_top_k: int = 120  # per query variant
@@ -156,6 +179,7 @@ class RetrievalConfig(BaseModel):
     synthesis_top_papers: int = 10
     synthesis_score_weight: float = 0.25  # blend of LLM relevance into final score
     boosts: EvidenceBoosts = Field(default_factory=EvidenceBoosts)
+    agents: AgentConfig = Field(default_factory=AgentConfig)
 
 
 @lru_cache

@@ -12,11 +12,14 @@ import openai
 
 from lnp_rag.config import Settings
 from lnp_rag.synthesis.prompts import (
+    CRITIC_SCHEMA,
+    CRITIC_SYSTEM,
     PARAPHRASE_SCHEMA,
     PARAPHRASE_SYSTEM,
     SYNTHESIS_SCHEMA,
     SYNTHESIS_SYSTEM,
     SynthesisError,
+    critic_user_message,
     paraphrase_user_message,
     synthesis_user_message,
 )
@@ -81,6 +84,11 @@ class OpenAIClient:
     def synthesize(self, query: str, papers: list[dict]) -> dict[str, dict]:
         result = self._call(SYNTHESIS_SYSTEM, synthesis_user_message(query, papers), SYNTHESIS_SCHEMA,
                             "paper_assessments", max_tokens=16000)
+        return {p["paper_key"]: p for p in result.get("papers", [])}
+
+    def review(self, query: str, folder: str, papers: list[dict]) -> dict[str, dict]:
+        result = self._call(CRITIC_SYSTEM, critic_user_message(query, folder, papers), CRITIC_SCHEMA,
+                            "critic_verdicts", max_tokens=16000)
         return {p["paper_key"]: p for p in result.get("papers", [])}
 
     def paraphrase_query(self, query: str, n: int = 3) -> list[str]:

@@ -116,5 +116,21 @@ class BM25Index:
             (self._ids[int(d)], float(s)) for d, s in zip(docs[0], scores[0]) if s > 0
         ]
 
+    def rows_for_papers(self, paper_ids: set[str]) -> tuple[list[str], np.ndarray, np.ndarray]:
+        """(chunk_ids, paper_id per chunk, index rows) of every indexed chunk of ``paper_ids``."""
+        with self._lock:
+            rows = np.flatnonzero(np.isin(self._paper_of, list(paper_ids))) if self._ids else np.array([], int)
+            return [self._ids[int(r)] for r in rows], self._paper_of[rows], rows
+
+    def score_rows(self, query: str, rows: np.ndarray) -> np.ndarray:
+        """Exhaustive BM25 scores of ``query`` for the given index rows (no top-k)."""
+        with self._lock:
+            if self._model is None or not len(rows):
+                return np.zeros(len(rows), dtype=np.float32)
+            tokens = [t for t in tokenize(query) if t in self._model.vocab_dict]
+            if not tokens:
+                return np.zeros(len(rows), dtype=np.float32)
+            return np.asarray(self._model.get_scores(tokens), dtype=np.float32)[rows]
+
     def __len__(self) -> int:
         return len(self._ids)
